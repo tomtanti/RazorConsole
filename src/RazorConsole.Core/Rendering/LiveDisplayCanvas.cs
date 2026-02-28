@@ -7,8 +7,12 @@ using Spectre.Console.Rendering;
 
 namespace RazorConsole.Core;
 
-internal sealed class LiveDisplayCanvas(IAnsiConsole ansiConsole) : ConsoleLiveDisplayContext.ILiveDisplayCanvas
+internal sealed class LiveDisplayCanvas(
+    IAnsiConsole ansiConsole,
+    Func<CursorHint?>? cursorHintSupplier = null
+    ) : ConsoleLiveDisplayContext.ILiveDisplayCanvas
 {
+    private readonly IAnsiConsole _ansiConsole = ansiConsole ?? throw new ArgumentNullException(nameof(ansiConsole));
     private DiffRenderable? _current;
     private readonly SemaphoreSlim _semaphore = new(1, 1);
 
@@ -33,14 +37,16 @@ internal sealed class LiveDisplayCanvas(IAnsiConsole ansiConsole) : ConsoleLiveD
 
         if (_current is null && renderable is not null)
         {
-            _current = new DiffRenderable(ansiConsole, renderable);
-            ansiConsole.Write(_current);
+            _current = new DiffRenderable(_ansiConsole, renderable);
+            ApplyCursorHint();
+            _ansiConsole.Write(_current);
             Refreshed?.Invoke();
         }
         else if (_current is not null && renderable is not null)
         {
             _current.UpdateRenderable(renderable);
-            ansiConsole.Write(_current);
+            ApplyCursorHint();
+            _ansiConsole.Write(_current);
             Refreshed?.Invoke();
         }
 
@@ -52,8 +58,9 @@ internal sealed class LiveDisplayCanvas(IAnsiConsole ansiConsole) : ConsoleLiveD
     {
         if (_current is not null)
         {
-            ansiConsole.Write(new ControlCode(string.Empty));
-            ansiConsole.Write(_current);
+            ApplyCursorHint();
+            _ansiConsole.Write(new ControlCode(string.Empty));
+            _ansiConsole.Write(_current);
             Refreshed?.Invoke();
         }
     }
@@ -66,4 +73,12 @@ internal sealed class LiveDisplayCanvas(IAnsiConsole ansiConsole) : ConsoleLiveD
 
     public bool TryUpdateAttributes(IReadOnlyList<int> path, IReadOnlyDictionary<string, string?> attributes)
         => false;
+
+    private void ApplyCursorHint()
+    {
+        if (_current is not null)
+        {
+            _current.CursorHint = cursorHintSupplier?.Invoke();
+        }
+    }
 }

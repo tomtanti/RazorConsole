@@ -21,6 +21,9 @@
     data-placeholder="@PlaceholderAttribute"
     data-mask-input="@MaskInputAttribute"
     data-has-value="@HasValueAttribute"
+    data-focused-border-color="@FocusedBorderColorAttribute"
+    data-content-left-padding="@ContentLeftPaddingAttribute"
+    data-border-left-padding="@BorderLeftPaddingAttribute"
     value="@_currentValue"
     @oninput="HandleInputAsync"
     @onchange="HandleSubmitAsync"
@@ -257,6 +260,13 @@
     private string HasValueAttribute => HasValue ? "true" : "false";
 
     private string MaskInputAttribute => MaskInput ? "true" : "false";
+
+    private string FocusedBorderColorAttribute =>
+        $"{FocusedBorderColor.R},{FocusedBorderColor.G},{FocusedBorderColor.B}";
+
+    private string ContentLeftPaddingAttribute => ContentPadding.Left.ToString(CultureInfo.InvariantCulture);
+
+    private string BorderLeftPaddingAttribute => BorderPadding.Left.ToString(CultureInfo.InvariantCulture);
 
     private bool HasValue => _currentValue.Length > 0;
 
