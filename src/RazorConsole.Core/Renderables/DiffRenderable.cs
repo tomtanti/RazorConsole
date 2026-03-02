@@ -15,8 +15,21 @@ internal class DiffRenderable : Renderable
     private SegmentShape _shape = new(0, 0);
     private List<SegmentLine> _previousLines = new();
     private int _lastMaxWidth = -1;
+    /// <summary>
+    /// Whether the cursor was repositioned for a cursor hint in the previous
+    /// render. When <see langword="true"/>, the next render must restore the
+    /// saved cursor position before calculating diffs.
+    /// </summary>
+    private bool _cursorPositionSaved;
 
     public bool DidOverflow { get; private set; }
+
+    /// <summary>
+    /// Gets or sets an optional hint describing where the terminal cursor should be
+    /// positioned after rendering (e.g. at the end of a focused text input value).
+    /// When <see langword="null"/>, the cursor is hidden after rendering.
+    /// </summary>
+    public CursorHint? CursorHint { get; set; }
 
     /// <summary>
     /// Initializes a new instance of the DiffRenderable class to display the differences between two renderable objects
@@ -43,6 +56,15 @@ internal class DiffRenderable : Renderable
         {
             yield return Segment.Control(RM(DECTCEM));
             DidOverflow = false;
+
+            // If the cursor was repositioned for a cursor hint in the previous
+            // render, restore it to the saved bottom-of-output position so that
+            // the diff calculations work correctly.
+            if (_cursorPositionSaved)
+            {
+                yield return Segment.Control(DECRC());
+                _cursorPositionSaved = false;
+            }
 
             bool widthChanged = _lastMaxWidth != -1 && _lastMaxWidth != maxWidth;
             _lastMaxWidth = maxWidth;
@@ -138,8 +160,270 @@ internal class DiffRenderable : Renderable
             // Update the previous lines for next comparison
             _previousLines = CloneLines(segmentLines);
             _shape = shape;
-            yield return Segment.Control(SM(DECTCEM));
+
+            // Position the cursor at the focused text input (if any) and show it,
+            // otherwise leave the cursor hidden so it doesn't flash at the bottom.
+            var cursorControl = BuildCursorPositionControl(segmentLines, totalLines);
+            if (cursorControl is not null)
+            {
+                // Save the current cursor position (bottom of output) so the next
+                // render can restore it with DECRC before doing diff calculations.
+                yield return Segment.Control(DECSC());
+                _cursorPositionSaved = true;
+                yield return Segment.Control(cursorControl);
+            }
         }
+    }
+
+    /// <summary>
+    /// Builds an ANSI control string that moves the cursor to the end of the
+    /// focused text input value and makes it visible. Returns <see langword="null"/>
+    /// when the cursor should stay hidden (no text input focused or value not found).
+    /// </summary>
+    private string? BuildCursorPositionControl(List<SegmentLine> segmentLines, int totalLines)
+    {
+        var hint = CursorHint;
+        if (hint is null)
+        {
+            return null;
+        }
+
+        // Find the content line inside the focused TextInput's panel by matching
+        // the unique focused border colour. A Panel typically renders as:
+        //   line 0: ╭──────╮   (top border — has the border colour)
+        //   line 1: │ text │   (content — the left │ has the border colour)
+        //   line 2: ╰──────╯   (bottom border)
+        // We want the content line (the one between top and bottom borders).
+        // When a Label is present the label and value may share a single line
+        // (via Columns layout), so we scan segments to find the actual value
+        // position rather than assuming it starts at the content area edge.
+        var borderColor = hint.FocusedBorderColor;
+        int matchedLineIndex = -1;
+        int matchedContentStart = -1;
+
+        for (var lineIndex = 0; lineIndex < totalLines; lineIndex++)
+        {
+            var line = segmentLines[lineIndex];
+            var contentStartColumn = FindContentStartColumn(line, borderColor);
+            if (contentStartColumn >= 0)
+            {
+                matchedLineIndex = lineIndex;
+                matchedContentStart = contentStartColumn;
+            }
+        }
+
+        if (matchedLineIndex < 0)
+        {
+            // Focused panel not found — keep cursor hidden
+            return null;
+        }
+
+        // Scan the matched content line to find the display content text.
+        // This locates the value/placeholder regardless of where the Columns
+        // layout placed it relative to the label.
+        var cursorColumn = FindDisplayContentColumn(
+            segmentLines[matchedLineIndex],
+            hint.DisplayContent,
+            hint.ValueCellLength,
+            matchedContentStart,
+            hint.ContentLeftPadding);
+
+        // Move cursor from current position (after the last NEL) to the target
+        var linesUp = totalLines - matchedLineIndex;
+        // Column is 0-based; CHA (and our helper) expects 1-based
+        return BuildCursorMoveSequence(linesUp, cursorColumn + 1);
+    }
+
+    /// <summary>
+    /// Scans a segment line to find the cell column where the cursor should be
+    /// placed. Searches for the <paramref name="displayContent"/> text within
+    /// segments and returns the column at the end of the value text. When the
+    /// display content cannot be located (e.g. the field is empty and has no
+    /// placeholder), falls back to the original calculation from the content
+    /// start position.
+    /// </summary>
+    private static int FindDisplayContentColumn(
+        SegmentLine line,
+        string displayContent,
+        int valueCellLength,
+        int contentStart,
+        int contentLeftPadding)
+    {
+        if (string.IsNullOrEmpty(displayContent))
+        {
+            // No display content to search for — place cursor at content start + padding.
+            return contentStart + contentLeftPadding;
+        }
+
+        // Build a list of (cellOffset, segment) pairs so we can search backwards.
+        // In a Columns layout the label appears before the value, so the last
+        // matching segment is the value/placeholder — not the label.
+        var entries = new List<(int CellOffset, Segment Segment)>();
+        int runningOffset = 0;
+        foreach (var segment in line)
+        {
+            if (segment.IsControlCode)
+            {
+                continue;
+            }
+
+            var segWidth = Segment.CellCount(new List<Segment> { segment });
+            entries.Add((runningOffset, segment));
+            runningOffset += segWidth;
+        }
+
+        // Search backwards to find the rightmost segment matching the display content.
+        for (int i = entries.Count - 1; i >= 0; i--)
+        {
+            var (cellOffset, segment) = entries[i];
+            var text = segment.Text;
+            if (text.Length == 0)
+            {
+                continue;
+            }
+
+            var trimmed = text.TrimEnd();
+            if (trimmed.Length == 0)
+            {
+                continue;
+            }
+
+            // Match when:
+            //   1. The segment text starts with the full display content, OR
+            //   2. The display content starts with the trimmed segment text
+            //      (the content was truncated to fit a Columns column width).
+            if (text.StartsWith(displayContent, StringComparison.Ordinal)
+                || displayContent.StartsWith(trimmed, StringComparison.Ordinal))
+            {
+                // The cursor sits right after the value text.
+                return cellOffset + valueCellLength;
+            }
+        }
+
+
+        // Fallback: display content not found in segments — use original calculation.
+        return contentStart + contentLeftPadding + valueCellLength;
+    }
+
+
+    /// <summary>
+    /// Scans a segment line for a panel content line that starts with a border
+    /// character in the specified <paramref name="borderColor"/>. Returns the
+    /// 0-based cell column where content starts (after the border character),
+    /// or -1 if this line does not match.
+    /// </summary>
+    /// <remarks>
+    /// A "content line" is one where the first styled segment is a single border
+    /// character (like │ or ┃) in the target colour, and subsequent segments
+    /// contain the actual content. This distinguishes it from top/bottom border
+    /// lines (which are entirely border characters like ╭──╮).
+    /// </remarks>
+    internal static int FindContentStartColumn(SegmentLine line, Spectre.Console.Color borderColor)
+    {
+        int cellOffset = 0;
+        bool foundBorderChar = false;
+
+        foreach (var segment in line)
+        {
+            if (segment.IsControlCode)
+            {
+                continue;
+            }
+
+            var segWidth = Segment.CellCount(new List<Segment> { segment });
+
+            if (!foundBorderChar)
+            {
+                // Look for a non-whitespace segment with the border colour.
+                // Skip whitespace/padding segments and segments belonging to
+                // outer (non-target) panel borders so that nested panels are
+                // handled correctly.
+                var trimmed = segment.Text.Trim();
+                if (trimmed.Length == 0)
+                {
+                    cellOffset += segWidth;
+                    continue;
+                }
+
+                if (segment.Style.Foreground == borderColor && trimmed.Length <= 2)
+                {
+                    // This is a border character segment (│, ║, ┃, etc.)
+                    // Check that remaining content follows — i.e., this is not a
+                    // top/bottom border line (which would have long runs of ─ chars).
+                    foundBorderChar = true;
+                    cellOffset += segWidth;
+                    continue;
+                }
+
+                // Visible segment doesn't match the target border colour.
+                // It could be an outer panel's border or other content — keep
+                // scanning so we can find a nested panel with the target colour.
+                cellOffset += segWidth;
+                continue;
+            }
+            else
+            {
+                // We found the border char; the next content starts here.
+                // But verify it's actually a content line — not a top/bottom border.
+                // Top/bottom borders have segments that are all border-coloured
+                // horizontal line chars (─, ═, etc.)
+                if (segment.Style.Foreground == borderColor)
+                {
+                    // Still border-coloured — this might be a top/bottom border line
+                    // or padding inside the panel that happens to match. Check if
+                    // the text is all box-drawing horizontal chars.
+                    var text = segment.Text.Trim();
+                    if (text.Length > 0 && IsHorizontalBorder(text))
+                    {
+                        return -1; // Top/bottom border line
+                    }
+                }
+
+                // This is the content start
+                return cellOffset;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Checks whether the text consists entirely of horizontal box-drawing characters
+    /// (used in top/bottom panel borders).
+    /// </summary>
+    private static bool IsHorizontalBorder(string text)
+    {
+        foreach (var ch in text)
+        {
+            // Common horizontal box-drawing characters: ─ ━ ═ ╌ ╍ ┄ ┅ ┈ ┉
+            if (ch != '─' && ch != '━' && ch != '═' && ch != '╌' && ch != '╍' &&
+                ch != '┄' && ch != '┅' && ch != '┈' && ch != '┉' && ch != '╶' &&
+                ch != '╴' && ch != '╸' && ch != '╺')
+            {
+                return false;
+            }
+        }
+
+        return text.Length > 0;
+    }
+
+    /// <summary>
+    /// Produces an ANSI sequence that moves the cursor up <paramref name="linesUp"/>
+    /// lines from the current position, then to column <paramref name="column"/> (1-based),
+    /// and makes the cursor visible.
+    /// </summary>
+    private static string BuildCursorMoveSequence(int linesUp, int column)
+    {
+        var sb = new System.Text.StringBuilder();
+        if (linesUp > 0)
+        {
+            sb.Append(CUU(linesUp));
+        }
+
+        // Move to absolute column using CHA (Cursor Horizontal Absolute)
+        sb.Append($"{CSI}{column}G");
+        sb.Append(SM(DECTCEM));
+        return sb.ToString();
     }
 
     private bool NeedsFullClear(int linesToMoveUp)

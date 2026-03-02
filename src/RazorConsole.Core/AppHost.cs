@@ -1,6 +1,7 @@
 // Copyright (c) RazorConsole. All rights reserved.
 
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using Microsoft.AspNetCore.Components;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -8,9 +9,11 @@ using Microsoft.Extensions.Logging;
 using RazorConsole.Core.Controllers;
 using RazorConsole.Core.Focus;
 using RazorConsole.Core.Input;
+using RazorConsole.Core.Renderables;
 using RazorConsole.Core.Rendering;
 using RazorConsole.Core.Utilities;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 
 namespace RazorConsole.Core;
 
@@ -122,8 +125,18 @@ internal class ComponentService<[DynamicallyAccessedMembers(DynamicallyAccessedM
             AnsiConsole.Clear();
         }
 
-        using var liveContext = new ConsoleLiveDisplayContext(new LiveDisplayCanvas(AnsiConsole.Console), consoleRenderer, terminalMonitor, null);
-        using var _ = consoleRenderer.Subscribe(focusManager);
+        // FocusManager must subscribe to the renderer BEFORE ConsoleLiveDisplayContext
+        // so that focus targets are updated with the latest VNode attributes (including
+        // the text input value) before ApplyCursorHint reads them for cursor positioning.
+        using var focusSubscription = consoleRenderer.Subscribe(focusManager);
+        using var liveContext = new ConsoleLiveDisplayContext(
+            new LiveDisplayCanvas(
+                AnsiConsole.Console,
+                () => ResolveCursorHint(focusManager)
+            ),
+            consoleRenderer,
+            terminalMonitor
+        );
         using var focusSession = focusManager.BeginSession(liveContext, initialView, token);
         await focusSession.InitializationTask.ConfigureAwait(false);
         var keyListenerTask = keyboardEventManager.RunAsync(token);
@@ -158,4 +171,89 @@ internal class ComponentService<[DynamicallyAccessedMembers(DynamicallyAccessedM
     }
 
     private static ParameterView CreateParameterView() => ParameterView.Empty;
+
+    /// <summary>
+    /// Reads the current focus state and builds a <see cref="CursorHint"/> that tells
+    /// <see cref="DiffRenderable"/> where to position the terminal cursor.
+    /// Returns <see langword="null"/> when no text input is focused.
+    /// </summary>
+    private static CursorHint? ResolveCursorHint(FocusManager fm)
+    {
+        if (!fm.TryGetFocusedTarget(out var target) || target is null)
+        {
+            return null;
+        }
+
+        if (!target.Attributes.TryGetValue("data-text-input", out var isTextInput)
+            || !string.Equals(isTextInput, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        // Parse the focused border colour from the data attribute (R,G,B format)
+        var borderColor = Color.Yellow; // fallback default
+        if (target.Attributes.TryGetValue("data-focused-border-color", out var colorStr)
+            && colorStr is not null)
+        {
+            var parts = colorStr.Split(',');
+            if (parts.Length == 3
+                && byte.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var r)
+                && byte.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var g)
+                && byte.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var b))
+            {
+                borderColor = new Color(r, g, b);
+            }
+        }
+
+        // Determine the displayed value length in cells
+        var value = string.Empty;
+        if (target.Attributes.TryGetValue("value", out var rawValue) && rawValue is not null)
+        {
+            value = rawValue;
+        }
+
+        // If the input is masked, the display shows bullet characters instead
+        if (target.Attributes.TryGetValue("data-mask-input", out var maskAttr)
+            && string.Equals(maskAttr, "true", StringComparison.OrdinalIgnoreCase)
+            && value.Length > 0)
+        {
+            value = new string('•', value.Length);
+        }
+
+        // Build the display content string (mirrors TextInput.DisplayContent logic)
+        var displayContent = value;
+        if (value.Length == 0)
+        {
+            target.Attributes.TryGetValue("data-placeholder", out var placeholder);
+            displayContent = placeholder ?? string.Empty;
+        }
+
+        // Calculate the cell width of the value
+        var valueCellLength = 0;
+        if (value.Length > 0)
+        {
+            valueCellLength = Segment.CellCount(
+                new List<Segment> { new(value) });
+        }
+
+        // Parse content left padding (from ContentPadding.Left on TextInput)
+        var contentLeftPadding = 1; // default ContentPadding is (1, 0, 1, 0)
+        if (target.Attributes.TryGetValue("data-content-left-padding", out var padStr)
+            && padStr is not null
+            && int.TryParse(padStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var padVal))
+        {
+            contentLeftPadding = padVal;
+        }
+
+        // Parse border left padding (from BorderPadding.Left on TextInput)
+        var borderLeftPadding = 0; // default BorderPadding is (0, 0, 0, 0)
+        if (target.Attributes.TryGetValue("data-border-left-padding", out var bPadStr)
+            && bPadStr is not null
+            && int.TryParse(bPadStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bPadVal))
+        {
+            borderLeftPadding = bPadVal;
+        }
+
+        return new CursorHint(borderColor, valueCellLength, contentLeftPadding + borderLeftPadding, displayContent);
+    }
 }

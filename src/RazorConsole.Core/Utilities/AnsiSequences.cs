@@ -207,4 +207,26 @@ public static class AnsiSequences
 
     public static string PP(int steps)
         => $"{CSI}{steps}V";
+
+    /// <summary>
+    /// Save cursor position (DEC private mode). Stores the current cursor position
+    /// so it can be restored later with <see cref="DECRC"/>.
+    /// </summary>
+    /// <remarks>
+    /// See <see href="https://vt100.net/docs/vt510-rm/DECSC.html"/>.
+    /// </remarks>
+    /// <returns>The ANSI escape code.</returns>
+    public static string DECSC()
+        => ESC + "7";
+
+    /// <summary>
+    /// Restore cursor position (DEC private mode). Restores the cursor position
+    /// previously saved with <see cref="DECSC"/>.
+    /// </summary>
+    /// <remarks>
+    /// See <see href="https://vt100.net/docs/vt510-rm/DECRC.html"/>.
+    /// </remarks>
+    /// <returns>The ANSI escape code.</returns>
+    public static string DECRC()
+        => ESC + "8";
 }
